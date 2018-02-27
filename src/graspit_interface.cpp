@@ -13,6 +13,7 @@
 #include <graspit/EGPlanner/searchState.h>
 #include <graspit/EGPlanner/egPlanner.h>
 #include <graspit/EGPlanner/simAnnPlanner.h>
+#include <graspit/EGPlanner/simAnnParams.h>
 #include <graspit/EGPlanner/guidedPlanner.h>
 #include <graspit/EGPlanner/energy/searchEnergyFactory.h>
 #include <graspit/EGPlanner/energy/searchEnergy.h>
@@ -105,6 +106,7 @@ int GraspitInterface::mainLoop()
         //So that when the signal is emitted, the slot function is executed by the correct thread.
         QObject::connect(this, SIGNAL(emitRunPlannerInMainThread()), this, SLOT(runPlannerInMainThread()), Qt::BlockingQueuedConnection);
         QObject::connect(this, SIGNAL(emitProcessPlannerResultsInMainThread()), this, SLOT(processPlannerResultsInMainThread()), Qt::BlockingQueuedConnection);
+        QObject::connect(this, SIGNAL(emitBuildFeedbackInMainThread()), this, SLOT(buildFeedbackInMainThread()), Qt::BlockingQueuedConnection);
         firstTimeInMainLoop = false;
         ROS_INFO("Planner Signal/Slots connected");
     }
@@ -764,15 +766,25 @@ void GraspitInterface::PlanGraspsCB(const graspit_interface::PlanGraspsGoalConst
     emit emitRunPlannerInMainThread();
 
     ROS_INFO("Waiting For Planner to Finish");
+    int last_feedback_step;
     while(mPlanner->isActive())
     {
-        sleep(1.0);
-        ROS_INFO("Curret Planner Step: %d", mPlanner->getCurrentStep());
-        ROS_INFO("Curret Num Grasps: %d", mPlanner->getListSize());
+        if (_goal->feedback_num_steps < 1){
+            continue;
+        }
+        int current_feedback_step = mPlanner->getCurrentStep();
+        if (current_feedback_step == mPlanner->getStartingStep()){
+            continue;
+        }
+        if ((current_feedback_step % _goal->feedback_num_steps == 0) && (current_feedback_step != last_feedback_step)){
+            ROS_INFO("Curret Planner Step: %d", mPlanner->getCurrentStep());
+            ROS_INFO("Curret Num Grasps: %d", mPlanner->getListSize());
 
-        feedback_.current_step = mPlanner->getCurrentStep();
-        feedback_.current_num_grasps = mPlanner->getListSize();
-        plan_grasps_as->publishFeedback(feedback_);
+            // collect grasps
+            emit emitBuildFeedbackInMainThread();
+            plan_grasps_as->publishFeedback(feedback_);
+            last_feedback_step = current_feedback_step;
+        }
     }
 
     ROS_INFO("About to Call emit emitProcessPlannerResultsInMainThread();");
@@ -780,6 +792,27 @@ void GraspitInterface::PlanGraspsCB(const graspit_interface::PlanGraspsGoalConst
 
     plan_grasps_as->setSucceeded(result_);
     ROS_INFO("Action ServerCB Finished");
+}
+
+
+void GraspitInterface::buildFeedbackInMainThread()
+{
+    feedback_.current_step = mPlanner->getCurrentStep();
+
+    Hand *mHand = graspitCore->getWorld()->getCurrentHand();
+
+    feedback_.grasps.clear();
+    feedback_.energies.clear();
+    for(int i = 0; i < mPlanner->getListSize(); i++)
+    {
+        const GraspPlanningState *gps  = mPlanner->getGrasp(i);
+        graspit_interface::Grasp g;
+        graspPlanningStateToROSMsg(gps, g, mHand);
+
+        feedback_.grasps.push_back(g);
+        feedback_.energies.push_back(gps->getEnergy());
+        feedback_.search_energy = goal.search_energy;
+    }
 }
 
 void GraspitInterface::runPlannerInMainThread()
@@ -861,6 +894,20 @@ void GraspitInterface::runPlannerInMainThread()
 
     mPlanner->setEnergyType(goal.search_energy);
 
+    if (goal.sim_ann_params.set_custom_params)
+    {
+        ROS_INFO("Switching SimAnn Annealing parameters to your custom defined values!!! ");
+        SimAnnParams simAnnParams;
+        simAnnParams.YC = goal.sim_ann_params.YC;
+        simAnnParams.HC = goal.sim_ann_params.HC;
+        simAnnParams.YDIMS = goal.sim_ann_params.YDIMS;
+        simAnnParams.NBR_ADJ = goal.sim_ann_params.NBR_ADJ;
+        simAnnParams.ERR_ADJ = goal.sim_ann_params.ERR_ADJ;
+        simAnnParams.DEF_T0 = goal.sim_ann_params.DEF_T0;
+        simAnnParams.DEF_K0 = goal.sim_ann_params.DEF_K0;
+        mPlanner->setAnnealingParameters(simAnnParams);
+    }
+
 
     switch(goal.search_contact.type) {
         case graspit_interface::SearchContact::CONTACT_PRESET :
@@ -900,6 +947,51 @@ void GraspitInterface::runPlannerInMainThread()
 
  }
 
+void GraspitInterface::graspPlanningStateToROSMsg(const GraspPlanningState* gps, graspit_interface::Grasp &g, Hand *mHand){
+    gps->execute(mHand);
+    mHand->autoGrasp(false,1.0,false);
+
+    geometry_msgs::Pose pose;
+    transf t = mHand->getTran();
+    pose.position.x = t.translation().x() / 1000.0;
+    pose.position.y = t.translation().y() / 1000.0;;
+    pose.position.z = t.translation().z() / 1000.0;;
+    pose.orientation.w = t.rotation().w();
+    pose.orientation.x = t.rotation().x();
+    pose.orientation.y = t.rotation().y();
+    pose.orientation.z = t.rotation().z();
+
+    geometry_msgs::Vector3Stamped approach_direction;
+    vec3 approachInHand = mHand->getApproachTran() *  vec3 (0, 0, 1);
+    approachInHand.normalize();
+    approach_direction.vector.x = approachInHand.x();
+    approach_direction.vector.y = approachInHand.y();
+    approach_direction.vector.z = approachInHand.z();
+    approach_direction.header.frame_id = mHand->getName().toStdString();
+
+    g.graspable_body_id = goal.graspable_body_id;
+
+    double dof[mHand->getNumDOF()];
+    mHand->getDOFVals(dof);
+    for(int i = 0; i <mHand->getNumDOF(); ++i)
+    {
+        g.dofs.push_back(dof[i]);
+    }
+
+    g.pose = pose;
+    mHand->getGrasp()->update();
+    QualVolume mVolQual( mHand->getGrasp(), ("Volume"),"L1 Norm");
+    QualEpsilon mEpsQual( mHand->getGrasp(), ("Epsilon"),"L1 Norm");
+
+    graspitCore->getWorld()->findAllContacts();
+    graspitCore->getWorld()->updateGrasps();
+
+    g.epsilon_quality= mEpsQual.evaluate();
+    g.volume_quality = mVolQual.evaluate();
+    g.approach_direction = approach_direction;
+}
+
+
  void GraspitInterface::processPlannerResultsInMainThread()
  {
      Hand *mHand = graspitCore->getWorld()->getCurrentHand();
@@ -919,65 +1011,21 @@ void GraspitInterface::runPlannerInMainThread()
     ROS_INFO("Publishing Result");
     for(int i = 0; i < mPlanner->getListSize(); i++)
     {
-        ROS_INFO("Loading Grasp");
         const GraspPlanningState *gps  = mPlanner->getGrasp(i);
-        gps->execute(mHand);
-        mHand->autoGrasp(false,1.0,false);
-
-        ROS_INFO("Building Pose");
-        geometry_msgs::Pose pose;
-        transf t = mHand->getTran();
-        pose.position.x = t.translation().x() / 1000.0;
-        pose.position.y = t.translation().y() / 1000.0;;
-        pose.position.z = t.translation().z() / 1000.0;;
-        pose.orientation.w = t.rotation().w();
-        pose.orientation.x = t.rotation().x();
-        pose.orientation.y = t.rotation().y();
-        pose.orientation.z = t.rotation().z();
-
-        geometry_msgs::Vector3Stamped approach_direction;
-        vec3 approachInHand = mHand->getApproachTran() *  vec3 (0, 0, 1);
-        approachInHand.normalize();
-        approach_direction.vector.x = approachInHand.x();
-        approach_direction.vector.y = approachInHand.y();
-        approach_direction.vector.z = approachInHand.z();
-        approach_direction.header.frame_id = mHand->getName().toStdString();
-
         graspit_interface::Grasp g;
-        g.graspable_body_id = goal.graspable_body_id;
+        graspPlanningStateToROSMsg(gps, g, mHand);
 
-        double dof[mHand->getNumDOF()];
-        mHand->getDOFVals(dof);
-        for(int i = 0; i <mHand->getNumDOF(); ++i)
-        {
-            g.dofs.push_back(dof[i]);
-        }
-
-        g.pose = pose;
-        mHand->getGrasp()->update();
-        QualVolume mVolQual( mHand->getGrasp(), ("Volume"),"L1 Norm");
-        QualEpsilon mEpsQual( mHand->getGrasp(), ("Epsilon"),"L1 Norm");
-
-        graspitCore->getWorld()->findAllContacts();
-        graspitCore->getWorld()->updateGrasps();
-
-        g.epsilon_quality= mEpsQual.evaluate();
-        g.volume_quality = mVolQual.evaluate();
-        g.approach_direction = approach_direction;
-
-        ROS_INFO("Pushing back grasp");
         result_.grasps.push_back(g);
         result_.energies.push_back(gps->getEnergy());
         result_.search_energy = goal.search_energy;
     }
 
-    ROS_INFO("Showing Grasp 0");
     if(mPlanner->getListSize() > 0)
     {
+        ROS_INFO("Showing Grasp 0");
         mPlanner->showGrasp(0);
     }
 
-    ROS_INFO("Cleaning up mPlanner and mHandObjectState");
     if(mHandObjectState != NULL)
     {
         delete mHandObjectState;
