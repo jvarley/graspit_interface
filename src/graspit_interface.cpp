@@ -612,10 +612,16 @@ bool GraspitInterface::clearWorldCB(graspit_interface::ClearWorld::Request &requ
 bool GraspitInterface::saveImageCB(graspit_interface::SaveImage::Request &request,
                    graspit_interface::SaveImage::Response &response)
 {
-    QString filename = QString(getenv("GRASPIT"))+
-            QString("/images/") +
-            QString(request.filename.data()) +
-            QString(".jpg");
+    QString filename;
+    std::string filenamePath(request.filename.data());
+
+    if(filenamePath[0] == '/')
+        filename = QString(request.filename.data());
+    else
+        filename = QString(getenv("GRASPIT"))+
+               QString("/images/") +
+               QString(request.filename.data()) +
+               QString(".jpg");
 
     ROS_INFO("Saving Image: %s",filename.toStdString().c_str());
     graspitCore->getIVmgr()->saveImage(filename);
