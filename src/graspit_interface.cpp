@@ -13,6 +13,7 @@
 #include <graspit/EGPlanner/searchState.h>
 #include <graspit/EGPlanner/egPlanner.h>
 #include <graspit/EGPlanner/simAnnPlanner.h>
+#include <graspit/EGPlanner/simAnnParams.h>
 #include <graspit/EGPlanner/guidedPlanner.h>
 #include <graspit/EGPlanner/energy/searchEnergyFactory.h>
 #include <graspit/EGPlanner/energy/searchEnergy.h>
@@ -613,10 +614,16 @@ bool GraspitInterface::clearWorldCB(graspit_interface::ClearWorld::Request &requ
 bool GraspitInterface::saveImageCB(graspit_interface::SaveImage::Request &request,
                    graspit_interface::SaveImage::Response &response)
 {
-    QString filename = QString(getenv("GRASPIT"))+
-            QString("/images/") +
-            QString(request.filename.data()) +
-            QString(".jpg");
+    QString filename;
+    std::string filenamePath(request.filename.data());
+
+    if(filenamePath[0] == '/')
+        filename = QString(request.filename.data());
+    else
+        filename = QString(getenv("GRASPIT"))+
+               QString("/images/") +
+               QString(request.filename.data()) +
+               QString(".jpg");
 
     ROS_INFO("Saving Image: %s",filename.toStdString().c_str());
     graspitCore->getIVmgr()->saveImage(filename);
@@ -886,6 +893,20 @@ void GraspitInterface::runPlannerInMainThread()
 
 
     mPlanner->setEnergyType(goal.search_energy);
+
+    if (goal.sim_ann_params.set_custom_params)
+    {
+        ROS_INFO("Switching SimAnn Annealing parameters to your custom defined values!!! ");
+        SimAnnParams simAnnParams;
+        simAnnParams.YC = goal.sim_ann_params.YC;
+        simAnnParams.HC = goal.sim_ann_params.HC;
+        simAnnParams.YDIMS = goal.sim_ann_params.YDIMS;
+        simAnnParams.NBR_ADJ = goal.sim_ann_params.NBR_ADJ;
+        simAnnParams.ERR_ADJ = goal.sim_ann_params.ERR_ADJ;
+        simAnnParams.DEF_T0 = goal.sim_ann_params.DEF_T0;
+        simAnnParams.DEF_K0 = goal.sim_ann_params.DEF_K0;
+        mPlanner->setAnnealingParameters(simAnnParams);
+    }
 
 
     switch(goal.search_contact.type) {
